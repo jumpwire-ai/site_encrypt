@@ -14,6 +14,7 @@ defmodule SiteEncrypt.Acme.Client.API do
   """
 
   alias SiteEncrypt.Acme.Client.Crypto
+  use Retry.Annotation
 
   defmodule Session do
     @moduledoc false
@@ -154,6 +155,18 @@ defmodule SiteEncrypt.Acme.Client.API do
         |> Map.update!(:status, &parse_status!/1)
 
       {:ok, Map.merge(order, result), session}
+    end
+  end
+
+  @spec clear_nonce(session()) :: session()
+  def clear_nonce(session), do: %Session{session | nonce: nil}
+
+  @retry with: constant_backoff(10_000) |> Stream.take(60)
+  def wait_for_order_ready(session, order) do
+    case session |> clear_nonce() |> order_status(order) do
+      {:ok, %{status: :valid} = order, session} -> {:ok, order, session}
+      {:ok, %{status: :ready} = order, session} -> {:ok, order, session}
+      {:ok, _, _session} -> {:error, :invalid}
     end
   end
 

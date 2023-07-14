@@ -41,6 +41,7 @@ defmodule SiteEncrypt.MixProject do
       {:x509, "~> 0.3"},
       {:tesla, "~> 1.4", optional: true},
       {:hackney, "~> 1.6"},
+      {:retry, "~> 0.14"},
     ]
   end
 
