@@ -12,8 +12,7 @@ defmodule SiteEncrypt.Acme.Client.API do
   interact with the server using the remaining functions of this module. The session doesn't hold
   any resources open, so you can safely use it from multiple processes.
   """
-  alias SiteEncrypt.HttpClient
-  alias SiteEncrypt.HttpClient
+
   alias SiteEncrypt.Acme.Client.Crypto
 
   defmodule Session do
@@ -86,7 +85,7 @@ defmodule SiteEncrypt.Acme.Client.API do
   @spec new_session(String.t(), JOSE.JWK.t(), session_opts) ::
           {:ok, session} | {:error, error}
   def new_session(directory_url, account_key, http_opts \\ []) do
-    with {response, session} <- initialize_session(http_opts, account_key, directory_url),
+    with {:ok, response, session} <- initialize_session(http_opts, account_key, directory_url),
          :ok <- validate_response(response) do
       directory =
         response.payload
@@ -165,7 +164,7 @@ defmodule SiteEncrypt.Acme.Client.API do
       challenges =
         response.payload
         |> Map.fetch!("challenges")
-        |> Stream.map(&normalize_keys(&1, ~w/status token type url/))
+        |> Stream.map(&normalize_keys(&1, ~w/status token type url error/))
         |> Enum.map(&Map.update!(&1, :status, fn value -> parse_status!(value) end))
 
       {:ok, challenges, session}
@@ -231,20 +230,23 @@ defmodule SiteEncrypt.Acme.Client.API do
       session = %Session{session | nonce: nil}
 
       case http_request(session, verb, url, headers: headers, body: body) do
-        {%{status: status} = response, session} when status in 200..299 ->
+        {:ok, %{status: status} = response, session} when status in 200..299 ->
           {:ok, response, session}
 
-        {%{payload: %{"type" => "urn:ietf:params:acme:error:badNonce"}}, session} ->
+        {:ok, %{status: 400, payload: %{"type" => "urn:ietf:params:acme:error:badNonce"}}, session} ->
           jws_request(session, verb, url, id_field, payload)
 
-        {response, session} ->
-          {:error, response, session}
+        {:ok, %{body: body = %{}}, session} -> {:error, body, session}
+
+        {:ok, response, session} -> {:error, response, session}
+
+        err -> err
       end
     end
   end
 
   defp get_nonce(%Session{nonce: nil} = session) do
-    with {response, session} <- http_request(session, :head, session.directory.new_nonce),
+    with {:ok, response, session} <- http_request(session, :head, session.directory.new_nonce),
          :ok <- validate_response(response),
          do: {:ok, session}
   end
@@ -271,28 +273,38 @@ defmodule SiteEncrypt.Acme.Client.API do
   defp id_map(:kid, session), do: %{"kid" => session.kid}
 
   defp http_request(session, verb, url, opts \\ []) do
-    opts =
-      opts
-      |> Keyword.put_new(:headers, [])
-      |> Keyword.update!(:headers, &[{"user-agent", "site_encrypt native client"} | &1])
-      |> Keyword.merge(session.http_opts)
+    opts = opts
+    |> Keyword.update(:headers, [], &[{"accept", "application/json"}, {"user-agent", "site_encrypt native client"} | &1])
+    |> Keyword.merge(session.http_opts)
 
-    response = HttpClient.request(verb, url, opts)
-
-    content_type = :proplists.get_value("content-type", response.headers, "")
-
-    payload =
-      if String.starts_with?(content_type, "application/json") or
-           String.starts_with?(content_type, "application/problem+json"),
-         do: Jason.decode!(response.body)
-
-    session =
-      case Enum.find(response.headers, &match?({"replay-nonce", _nonce}, &1)) do
-        {"replay-nonce", nonce} -> %Session{session | nonce: nonce}
-        nil -> session
+    # Couldn't figure out how to set insecure/cafile for Mint, so just use Hackney
+    # when running a local ACME server
+    adapter =
+      if String.starts_with?(url, "https://localhost") do
+        {Tesla.Adapter.Hackney, insecure: true}
+      else
+        nil
       end
 
-    {Map.put(response, :payload, payload), session}
+    client = Tesla.client([
+      {Tesla.Middleware.Timeout, timeout: 5_000},
+      {Tesla.Middleware.Headers, opts[:headers]},
+      {Tesla.Middleware.JSON,
+       decode_content_types: ["application/jose+json", "application/problem+json"]},
+    ], adapter)
+
+    case Tesla.request(client, method: verb, url: url, params: opts[:params], body: opts[:body]) do
+      {:ok, response} ->
+        session =
+          case Enum.find(response.headers, &match?({"replay-nonce", _nonce}, &1)) do
+            {"replay-nonce", nonce} -> %Session{session | nonce: nonce}
+            nil -> session
+          end
+
+        {:ok, Map.put(response, :payload, response.body), session}
+
+      err -> err
+    end
   end
 
   defp parse_status!("invalid"), do: :invalid
@@ -309,6 +321,6 @@ defmodule SiteEncrypt.Acme.Client.API do
     end)
   end
 
-  defp validate_response(response),
-    do: if(response.status in 200..299, do: :ok, else: {:error, response})
+  defp validate_response(%{status: status}) when status in 200..299, do: :ok
+  defp validate_response(response), do: {:error, response}
 end
